@@ -117,13 +117,16 @@ async function authInstagram({ code }: { code: string }): Promise<{ success: boo
 // 4) Tool Functions: Instagram Media Operations
 // --------------------------------------------------------------------
 
-// List all media posts from the authenticated Instagram professional account.
-// This calls the /<IG_ID>/media endpoint.
-async function listInstagramMedia(): Promise<InstagramMedia[]> {
-  if (!instagramAccessToken || !instagramUserId) throw new Error('No Instagram access token available.')
-  const response = await fetch(`https://graph.instagram.com/${instagramUserId}/media?access_token=${instagramAccessToken}`, {
-    method: 'GET'
-  })
+async function listInstagramMedia(): Promise<any[]> {
+  if (!instagramAccessToken || !instagramUserId) {
+    throw new Error('No Instagram access token available.')
+  }
+  // Request all available fields. Depending on your app's permissions,
+  // some of these fields may not be returned.
+  const fields = 'id,caption,media_type,media_url,permalink,timestamp,username,thumbnail_url,children,media_product_type,comments_count,like_count'
+  const url = `https://graph.instagram.com/v22.0/${instagramUserId}/media?fields=${fields}&access_token=${instagramAccessToken}`
+
+  const response = await fetch(url, { method: 'GET' })
   const data = await response.json()
   if (!response.ok || data.error) {
     throw new Error(`Failed to fetch media: ${data.error ? data.error.message : 'Unknown error'}`)
