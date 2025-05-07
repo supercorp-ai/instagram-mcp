@@ -260,7 +260,10 @@ function createMcpServer(memoryKey: string, config: Config, toolsPrefix: string)
   server.tool(
     `${toolsPrefix}auth_url`,
     'Return an OAuth URL for Instagram login with instagram_business_basic and instagram_business_content_publish scopes.',
-    {},
+    {
+      // TODO: MCP SDK bug patch - remove when fixed
+      comment: z.string().optional(),
+    },
     async () => {
       try {
         const authUrl = generateInstagramAuthUrl(config);
@@ -288,7 +291,10 @@ function createMcpServer(memoryKey: string, config: Config, toolsPrefix: string)
   server.tool(
     `${toolsPrefix}list_media`,
     'List all media posts from the authenticated Instagram account.',
-    {},
+    {
+      // TODO: MCP SDK bug patch - remove when fixed
+      comment: z.string().optional(),
+    },
     async () => {
       try {
         const media = await listInstagramMedia(storage, config, memoryKey);
