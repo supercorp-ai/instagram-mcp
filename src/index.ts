@@ -6,8 +6,11 @@ import express, { Request, Response as ExpressResponse } from 'express'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
+import { InMemoryEventStore } from '@modelcontextprotocol/sdk/examples/shared/inMemoryEventStore.js'
 import { z } from 'zod'
 import { Redis } from '@upstash/redis'
+import { randomUUID } from 'node:crypto'
 
 // --------------------------------------------------------------------
 // Helper: JSON Response Formatter
@@ -28,7 +31,7 @@ function toTextJson(data: unknown): { content: Array<{ type: 'text'; text: strin
 // --------------------------------------------------------------------
 interface Config {
   port: number;
-  transport: 'sse' | 'stdio';
+  transport: 'sse' | 'stdio' | 'http';
   storage: 'memory-single' | 'memory' | 'upstash-redis-rest';
   instagramAppId: string;
   instagramAppSecret: string;
@@ -70,7 +73,11 @@ class RedisStorage implements Storage {
   }
   async get(memoryKey: string): Promise<Record<string, any> | undefined> {
     const data = await this.redis.get(`${this.keyPrefix}:${memoryKey}`);
-    return data === null ? undefined : data;
+    if (data === null) return undefined;
+    if (typeof data === 'string') {
+      try { return JSON.parse(data); } catch { return undefined; }
+    }
+    return data as any;
   }
   async set(memoryKey: string, data: Record<string, any>) {
     const existing = (await this.get(memoryKey)) || {};
@@ -83,8 +90,7 @@ class RedisStorage implements Storage {
 // Instagram OAuth & API Helpers
 // --------------------------------------------------------------------
 /**
- * For Instagram Basic Display API, we use OAuth.
- * Stored credentials (per memoryKey) will include:
+ * Stored credentials (per memoryKey):
  *   { provider: "instagram", accessToken: string, userId: string }
  */
 
@@ -125,7 +131,6 @@ async function exchangeInstagramAuthCode(
   if (!data.access_token) {
     throw new Error('Failed to obtain Instagram access token.');
   }
-  // Save tokens in storage.
   await storage.set(memoryKey, { provider: 'instagram', accessToken: data.access_token, userId: data.user_id });
   return data.access_token;
 }
@@ -133,7 +138,7 @@ async function exchangeInstagramAuthCode(
 // Fetch the authenticated Instagram user’s basic profile.
 async function fetchInstagramUser(
   storage: Storage,
-  config: Config,
+  _config: Config,
   memoryKey: string
 ): Promise<{ user_id: string; username: string }> {
   const stored = await storage.get(memoryKey);
@@ -145,7 +150,6 @@ async function fetchInstagramUser(
   if (!data.user_id) {
     throw new Error('Failed to fetch Instagram user id.');
   }
-  // Update stored userId.
   await storage.set(memoryKey, { userId: data.user_id });
   return data;
 }
@@ -163,7 +167,7 @@ async function authInstagram(
 }
 
 // List media from Instagram.
-async function listInstagramMedia(storage: Storage, config: Config, memoryKey: string): Promise<any[]> {
+async function listInstagramMedia(storage: Storage, _config: Config, memoryKey: string): Promise<any[]> {
   const stored = await storage.get(memoryKey);
   if (!stored || !stored.accessToken || !stored.userId) {
     throw new Error('No Instagram credentials available. Authenticate first.');
@@ -182,7 +186,7 @@ async function listInstagramMedia(storage: Storage, config: Config, memoryKey: s
 async function createInstagramPost(
   args: { imageUrl: string; caption: string },
   storage: Storage,
-  config: Config,
+  _config: Config,
   memoryKey: string
 ): Promise<{ success: boolean; message: string; postId: string }> {
   const stored = await storage.get(memoryKey);
@@ -216,6 +220,7 @@ async function createInstagramPost(
     throw new Error(`Error creating media container: ${error.message}`);
   }
   const containerId = containerData.id;
+
   // Step 2: Publish the media container.
   let publishData: any;
   const publishUrl = `https://graph.instagram.com/v22.0/${stored.userId}/media_publish`;
@@ -252,7 +257,6 @@ function createMcpServer(memoryKey: string, config: Config, toolsPrefix: string)
     name: `Instagram MCP Server (Memory Key: ${memoryKey})`,
     version: '1.0.0'
   });
-  // Use storage as per configuration.
   const storage: Storage = config.storage === 'upstash-redis-rest'
     ? new RedisStorage(config.upstashRedisRestUrl!, config.upstashRedisRestToken!, config.storageHeaderKey!)
     : new MemoryStorage();
@@ -323,7 +327,7 @@ function createMcpServer(memoryKey: string, config: Config, toolsPrefix: string)
 }
 
 //////////////////////////////////////////////////////////////////////////////
-// Express/SSE/stdio Setup (same as in other MCPs)
+// Express / Streamable HTTP / SSE / stdio Setup
 //////////////////////////////////////////////////////////////////////////////
 
 const log = (...args: any[]): void => console.log('[instagram-mcp]', ...args)
@@ -332,7 +336,7 @@ const logErr = (...args: any[]): void => console.error('[instagram-mcp]', ...arg
 async function main() {
   const argv = yargs(hideBin(process.argv))
     .option('port', { type: 'number', default: 8000 })
-    .option('transport', { type: 'string', choices: ['sse', 'stdio'], default: 'sse' })
+    .option('transport', { type: 'string', choices: ['sse', 'stdio', 'http'], default: 'sse' })
     .option('storage', {
       type: 'string',
       choices: ['memory-single', 'memory', 'upstash-redis-rest'],
@@ -351,11 +355,10 @@ async function main() {
     .help()
     .parseSync();
 
-  // Build configuration
   const config: Config = {
     port: argv.port,
-    transport: argv.transport as 'sse' | 'stdio',
-    storage: argv.storage as 'memory-single' | 'memory' | 'upstash-redis-rest',
+    transport: argv.transport as Config['transport'],
+    storage: argv.storage as Config['storage'],
     instagramAppId: argv.instagramAppId,
     instagramAppSecret: argv.instagramAppSecret,
     instagramRedirectUri: argv.instagramRedirectUri,
@@ -370,7 +373,6 @@ async function main() {
     upstashRedisRestToken: argv.upstashRedisRestToken,
   };
 
-  // Additional CLI validation:
   if ((argv.upstashRedisRestUrl || argv.upstashRedisRestToken) && config.storage !== 'upstash-redis-rest') {
     console.error("Error: --upstashRedisRestUrl and --upstashRedisRestToken can only be used when --storage is 'upstash-redis-rest'.");
     process.exit(1);
@@ -388,6 +390,7 @@ async function main() {
 
   const toolsPrefix: string = argv.toolsPrefix;
 
+  // stdio
   if (config.transport === 'stdio') {
     const memoryKey = "single";
     const server = createMcpServer(memoryKey, config, toolsPrefix);
@@ -397,6 +400,153 @@ async function main() {
     return;
   }
 
+  // Streamable HTTP (root "/")
+  if (config.transport === 'http') {
+    const app = express();
+
+    // Do not JSON-parse "/" — the transport handles raw body/streaming
+    app.use((req, res, next) => {
+      if (req.path === '/') return next();
+      express.json()(req, res, next);
+    });
+
+    interface HttpSession {
+      memoryKey: string;
+      server: McpServer;
+      transport: StreamableHTTPServerTransport;
+    }
+    const sessions = new Map<string, HttpSession>();
+
+    function resolveMemoryKeyFromHeaders(req: Request): string | undefined {
+      if (config.storage === 'memory-single') return 'single';
+      const keyName = (config.storageHeaderKey as string).toLowerCase();
+      const headerVal = req.headers[keyName];
+      if (typeof headerVal !== 'string' || !headerVal.trim()) return undefined;
+      return headerVal.trim();
+    }
+
+    function createServerFor(memoryKey: string) {
+      return createMcpServer(memoryKey, config, toolsPrefix);
+    }
+
+    // POST / — JSON-RPC input; initializes a session if none exists
+    app.post('/', async (req: Request, res: ExpressResponse) => {
+      try {
+        const sessionId = req.headers['mcp-session-id'] as string | undefined;
+
+        if (sessionId && sessions.has(sessionId)) {
+          const { transport } = sessions.get(sessionId)!;
+          await transport.handleRequest(req, res);
+          return;
+        }
+
+        // New initialization — require a valid memoryKey (no anonymous)
+        const memoryKey = resolveMemoryKeyFromHeaders(req);
+        if (!memoryKey) {
+          res.status(400).json({
+            jsonrpc: '2.0',
+            error: { code: -32000, message: `Bad Request: Missing or invalid "${config.storageHeaderKey}" header` },
+            id: (req as any)?.body?.id
+          });
+          return;
+        }
+
+        const server = createServerFor(memoryKey);
+        const eventStore = new InMemoryEventStore();
+
+        let transport!: StreamableHTTPServerTransport;
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          eventStore,
+          onsessioninitialized: (newSessionId: string) => {
+            sessions.set(newSessionId, { memoryKey, server, transport });
+            log(`[${newSessionId}] HTTP session initialized for key "${memoryKey}"`);
+          }
+        });
+
+        transport.onclose = async () => {
+          const sid = transport.sessionId;
+          if (sid && sessions.has(sid)) {
+            sessions.delete(sid);
+            log(`[${sid}] Transport closed; removed session`);
+          }
+          try { await server.close(); } catch { /* already closed */ }
+        };
+
+        await server.connect(transport);
+        await transport.handleRequest(req, res);
+      } catch (err) {
+        logErr('Error handling HTTP POST /:', err);
+        if (!res.headersSent) {
+          res.status(500).json({
+            jsonrpc: '2.0',
+            error: { code: -32603, message: 'Internal server error' },
+            id: (req as any)?.body?.id
+          });
+        }
+      }
+    });
+
+    // GET / — server->client event stream (SSE under the hood)
+    app.get('/', async (req: Request, res: ExpressResponse) => {
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      if (!sessionId || !sessions.has(sessionId)) {
+        res.status(400).json({
+          jsonrpc: '2.0',
+          error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
+          id: (req as any)?.body?.id
+        });
+        return;
+      }
+      try {
+        const { transport } = sessions.get(sessionId)!;
+        await transport.handleRequest(req, res);
+      } catch (err) {
+        logErr(`[${sessionId}] Error handling HTTP GET /:`, err);
+        if (!res.headersSent) {
+          res.status(500).json({
+            jsonrpc: '2.0',
+            error: { code: -32603, message: 'Internal server error' },
+            id: (req as any)?.body?.id
+          });
+        }
+      }
+    });
+
+    // DELETE / — session termination
+    app.delete('/', async (req: Request, res: ExpressResponse) => {
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      if (!sessionId || !sessions.has(sessionId)) {
+        res.status(400).json({
+          jsonrpc: '2.0',
+          error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
+          id: (req as any)?.body?.id
+        });
+        return;
+      }
+      try {
+        const { transport } = sessions.get(sessionId)!;
+        await transport.handleRequest(req, res);
+      } catch (err) {
+        logErr(`[${sessionId}] Error handling HTTP DELETE /:`, err);
+        if (!res.headersSent) {
+          res.status(500).json({
+            jsonrpc: '2.0',
+            error: { code: -32603, message: 'Error handling session termination' },
+            id: (req as any)?.body?.id
+          });
+        }
+      }
+    });
+
+    app.listen(config.port, () => {
+      log(`Listening on port ${config.port} (http)`);
+    });
+
+    return; // stop here for http transport
+  }
+
+  // SSE transport
   const app = express();
   interface ServerSession {
     memoryKey: string;
@@ -465,7 +615,7 @@ async function main() {
   });
 
   app.listen(argv.port, () => {
-    log(`Listening on port ${argv.port} (${argv.transport})`);
+    log(`Listening on port ${argv.transport === 'http' ? '(http)' : argv.transport} at ${argv.port}`);
   });
 }
 
