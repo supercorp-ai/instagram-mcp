@@ -108,6 +108,101 @@ function generateInstagramAuthUrl(config: Config): string {
   return `https://api.instagram.com/oauth/authorize?${params.toString()}`;
 }
 
+// Exchange a short-lived Instagram user token for a long-lived token (~60 days)
+async function exchangeToLongLivedInstagramToken(
+  shortLivedToken: string,
+  config: Config
+): Promise<{ access_token: string; token_type?: string; expires_in?: number }> {
+  const params = new URLSearchParams({
+    grant_type: 'ig_exchange_token',
+    client_secret: config.instagramAppSecret,
+    access_token: shortLivedToken,
+  });
+  const url = `https://graph.instagram.com/access_token?${params.toString()}`;
+  const resp = await fetch(url, { method: 'GET' });
+  const data = await resp.json();
+  if (!resp.ok || !data?.access_token) {
+    const msg = data?.error?.message || 'Failed to exchange for long-lived Instagram token';
+    throw new Error(msg);
+  }
+  return data;
+}
+
+// Refresh a long-lived Instagram user token (extends ~60 days again)
+async function refreshLongLivedInstagramToken(
+  longLivedToken: string
+): Promise<{ access_token: string; token_type?: string; expires_in?: number }> {
+  const params = new URLSearchParams({
+    grant_type: 'ig_refresh_token',
+    access_token: longLivedToken,
+  });
+  const url = `https://graph.instagram.com/refresh_access_token?${params.toString()}`;
+  const resp = await fetch(url, { method: 'GET' });
+  const data = await resp.json();
+  if (!resp.ok || !data?.access_token) {
+    const msg = data?.error?.message || 'Failed to refresh long-lived Instagram token';
+    throw new Error(msg);
+  }
+  return data;
+}
+
+// Ensure we have a long-lived token stored at key `accessToken`.
+// Backward compatible: if an existing token has no expiry metadata, attempt upgrade in place.
+async function ensureLongLivedInstagramToken(
+  storage: Storage,
+  config: Config,
+  memoryKey: string
+): Promise<string> {
+  const stored = await storage.get(memoryKey);
+  if (!stored || !stored.accessToken) {
+    throw new Error('No Instagram access token available.');
+  }
+
+  const current = stored.accessToken as string;
+
+  const now = Date.now();
+  const expiresAt: number | undefined = stored.accessTokenExpiresAt;
+
+  // If we know expiry and it is far enough in the future, just use it.
+  if (expiresAt && expiresAt > now) {
+    // Proactively refresh if within 7 days of expiry
+    const sevenDays = 7 * 24 * 60 * 60 * 1000;
+    if (expiresAt - now < sevenDays) {
+      try {
+        console.log('[instagram-mcp] Access token near expiry; refreshing long-lived token.');
+        const refreshed = await refreshLongLivedInstagramToken(current);
+        const newExpiresAt = refreshed.expires_in ? now + refreshed.expires_in * 1000 : undefined;
+        await storage.set(memoryKey, {
+          accessToken: refreshed.access_token,
+          accessTokenType: refreshed.token_type || stored.accessTokenType,
+          accessTokenExpiresAt: newExpiresAt,
+        });
+        return refreshed.access_token;
+      } catch (e) {
+        console.warn('[instagram-mcp] Token refresh failed; using existing token until expiry.', e);
+        return current;
+      }
+    }
+    return current;
+  }
+
+  // No known expiry => attempt to upgrade to long-lived token.
+  try {
+    console.log('[instagram-mcp] Upgrading to long-lived Instagram token.');
+    const exchanged = await exchangeToLongLivedInstagramToken(current, config);
+    const newExpiresAt = exchanged.expires_in ? now + exchanged.expires_in * 1000 : undefined;
+    await storage.set(memoryKey, {
+      accessToken: exchanged.access_token,
+      accessTokenType: exchanged.token_type,
+      accessTokenExpiresAt: newExpiresAt,
+    });
+    return exchanged.access_token;
+  } catch (e) {
+    console.warn('[instagram-mcp] Long-lived upgrade failed; keeping existing token for compatibility.', e);
+    return current;
+  }
+}
+
 // Exchange an auth code for an Instagram access token.
 async function exchangeInstagramAuthCode(
   code: string,
@@ -131,8 +226,27 @@ async function exchangeInstagramAuthCode(
   if (!data.access_token) {
     throw new Error('Failed to obtain Instagram access token.');
   }
-  await storage.set(memoryKey, { provider: 'instagram', accessToken: data.access_token, userId: data.user_id });
-  return data.access_token;
+  // Store provider and userId immediately for backward compatibility
+  await storage.set(memoryKey, { provider: 'instagram', userId: data.user_id });
+
+  // Try to upgrade to a long-lived token immediately; if it fails, store short-lived.
+  let finalToken = data.access_token as string;
+  try {
+    console.log('[instagram-mcp] Exchanging short-lived token for long-lived token.');
+    const exchanged = await exchangeToLongLivedInstagramToken(data.access_token, config);
+    finalToken = exchanged.access_token;
+    const now = Date.now();
+    const newExpiresAt = exchanged.expires_in ? now + exchanged.expires_in * 1000 : undefined;
+    await storage.set(memoryKey, {
+      accessToken: finalToken,
+      accessTokenType: exchanged.token_type,
+      accessTokenExpiresAt: newExpiresAt,
+    });
+  } catch (e) {
+    console.warn('[instagram-mcp] Long-lived exchange failed; storing short-lived token.', e);
+    await storage.set(memoryKey, { accessToken: finalToken });
+  }
+  return finalToken;
 }
 
 // Fetch the authenticated Instagram user’s basic profile.
@@ -141,11 +255,9 @@ async function fetchInstagramUser(
   _config: Config,
   memoryKey: string
 ): Promise<{ user_id: string; username: string }> {
-  const stored = await storage.get(memoryKey);
-  if (!stored || !stored.accessToken) {
-    throw new Error('No Instagram access token available.');
-  }
-  const response = await fetch(`https://graph.instagram.com/me?fields=user_id,username&access_token=${stored.accessToken}`, { method: 'GET' });
+  // Ensure a long-lived token (auto-upgrade legacy tokens)
+  const accessToken = await ensureLongLivedInstagramToken(storage, _config, memoryKey);
+  const response = await fetch(`https://graph.instagram.com/me?fields=user_id,username&access_token=${accessToken}`, { method: 'GET' });
   const data = await response.json();
   if (!data.user_id) {
     throw new Error('Failed to fetch Instagram user id.');
@@ -169,11 +281,12 @@ async function authInstagram(
 // List media from Instagram.
 async function listInstagramMedia(storage: Storage, _config: Config, memoryKey: string): Promise<any[]> {
   const stored = await storage.get(memoryKey);
-  if (!stored || !stored.accessToken || !stored.userId) {
+  if (!stored || !stored.userId) {
     throw new Error('No Instagram credentials available. Authenticate first.');
   }
+  const accessToken = await ensureLongLivedInstagramToken(storage, _config, memoryKey);
   const fields = 'id,caption,media_type,media_url,permalink,timestamp,username,thumbnail_url,children,media_product_type,comments_count,like_count';
-  const url = `https://graph.instagram.com/v22.0/${stored.userId}/media?fields=${fields}&access_token=${stored.accessToken}`;
+  const url = `https://graph.instagram.com/v22.0/${stored.userId}/media?fields=${fields}&access_token=${accessToken}`;
   const response = await fetch(url, { method: 'GET' });
   const data = await response.json();
   if (!response.ok || data.error) {
@@ -190,9 +303,10 @@ async function createInstagramPost(
   memoryKey: string
 ): Promise<{ success: boolean; message: string; postId: string }> {
   const stored = await storage.get(memoryKey);
-  if (!stored || !stored.accessToken || !stored.userId) {
+  if (!stored || !stored.userId) {
     throw new Error('No Instagram credentials available. Authenticate first.');
   }
+  const accessToken = await ensureLongLivedInstagramToken(storage, _config, memoryKey);
   // Step 1: Create a media container.
   let containerData: any;
   const containerUrl = `https://graph.instagram.com/v22.0/${stored.userId}/media`;
@@ -203,7 +317,7 @@ async function createInstagramPost(
       body: JSON.stringify({
         image_url: args.imageUrl,
         caption: args.caption,
-        access_token: stored.accessToken
+        access_token: accessToken
       })
     });
     const contentType = containerResponse.headers.get("content-type") || "";
@@ -230,7 +344,7 @@ async function createInstagramPost(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         creation_id: containerId,
-        access_token: stored.accessToken
+        access_token: accessToken
       })
     });
     const contentType = publishResponse.headers.get("content-type") || "";
